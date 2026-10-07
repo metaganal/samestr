@@ -418,15 +418,45 @@ def _codon_degeneracy():
     return table
 
 
+# the six unordered allele pairs (indices into ACGT), in this order
+_ALLELE_PAIRS = ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
+
+
+def _codon_synonymous_pairs():
+    """(64, 3) uint8 table of 6-bit masks: bit k is set if the two alleles
+    of _ALLELE_PAIRS[k], placed at that codon position (the other two
+    positions as in the reference codon), encode the same amino acid, i.e.
+    a polymorphism between them is synonymous. Stop codons get 0."""
+    table = np.zeros((64, 3), dtype=np.uint8)
+    for codon, aa in _CODON_AA.items():
+        if aa == '*':
+            continue
+        idx = 16 * _BASES.index(codon[0]) + 4 * _BASES.index(codon[1]) + \
+            _BASES.index(codon[2])
+        for pos in range(3):
+            aas = [_CODON_AA[codon[:pos] + b + codon[pos + 1:]]
+                   for b in _BASES]
+            table[idx, pos] = sum(1 << k for k, (a, b) in
+                                  enumerate(_ALLELE_PAIRS) if aas[a] == aas[b])
+    return table
+
+
 _DEGENERACY = _codon_degeneracy()
+_SYN_PAIRS = _codon_synonymous_pairs()
 
 
-def site_degeneracy(seq):
+def site_annotation(seq):
     """
-    Degeneracy (1-4) of every position of a protein coding sequence, read in
-    frame 0 on the given strand; 0 at codons with non-ACGT bases and at stop
-    codons. Returns None if seq does not look like an in-frame CDS (length
-    not a multiple of 3 or an internal stop codon), so it can be skipped.
+    Per-position annotation of a protein coding sequence, read in frame 0 on
+    the given strand:
+      degeneracy: (L,) int8, number of nucleotides (1-4) encoding the
+                  reference amino acid; 0 at codons with non-ACGT bases and
+                  at stop codons.
+      syn_pairs:  (L,) uint8 6-bit mask, bit k set if a polymorphism between
+                  the alleles of _ALLELE_PAIRS[k] is synonymous (assuming
+                  the rest of the codon is the reference).
+    Returns None if seq does not look like an in-frame CDS (length not a
+    multiple of 3 or an internal stop codon), so it can be skipped.
     """
     seq = str(seq).upper()
     if len(seq) < 3 or len(seq) % 3:
@@ -441,7 +471,15 @@ def site_degeneracy(seq):
     stop = valid & (deg == 0).all(axis=1)
     if stop[:-1].any():
         return None  # internal stop: not in frame 0 / not a CDS
-    return deg.ravel()
+    syn = np.where(valid[:, None], _SYN_PAIRS[idx], 0).astype(np.uint8)
+    return deg.ravel(), syn.ravel()
+
+
+def site_degeneracy(seq):
+    """Degeneracy (1-4) per position of an in-frame CDS, see
+    site_annotation. None if seq is not an in-frame CDS."""
+    ann = site_annotation(seq)
+    return None if ann is None else ann[0]
 
 
 def _read_fasta_gz(path):
@@ -461,9 +499,10 @@ def _read_fasta_gz(path):
     return seqs
 
 
-def clade_site_degeneracy(marker_dir, clade, n_sites, remaining_pos=None):
+def clade_site_annotation(marker_dir, clade, n_sites, remaining_pos=None):
     """
-    Degeneracy per alignment column of a clade, from the SameStr database
+    Degeneracy and synonymous allele pairs per alignment column of a clade
+    (see site_annotation), from the SameStr database
     (`<clade>.markers.fa.gz` + `<clade>.positions.txt.gz`).
 
     Args:
@@ -472,6 +511,7 @@ def clade_site_degeneracy(marker_dir, clade, n_sites, remaining_pos=None):
             to `<clade>.pos.txt` by `samestr filter --delete-pos`).
     Returns:
         ((n_sites,) int8 degeneracy, 0 = unknown/not coding in frame,
+         (n_sites,) uint8 synonymous-pair masks,
          number of markers usable as CDS, total number of markers),
         or None if the database files are missing or do not match.
     """
@@ -485,27 +525,29 @@ def clade_site_degeneracy(marker_dir, clade, n_sites, remaining_pos=None):
     seqs = _read_fasta_gz(fa_file)
     n_orig = max([end for _, end, _ in positions.values()] + [0])
     degeneracy = np.zeros(n_orig, dtype=np.int8)
+    syn_pairs = np.zeros(n_orig, dtype=np.uint8)
     n_cds = 0
     for marker, (start, end, length) in positions.items():
         seq = seqs.get(marker)
         if seq is None or len(seq) != length:
             continue
-        deg = site_degeneracy(seq)
-        if deg is not None:
-            degeneracy[start:end] = deg
+        ann = site_annotation(seq)
+        if ann is not None:
+            degeneracy[start:end], syn_pairs[start:end] = ann
             n_cds += 1
     if remaining_pos is None:
         if n_orig != n_sites:
             LOG.warning('%s: alignment has %s columns but markers span %s '
                         'positions.' % (clade, n_sites, n_orig))
             return None
-        return degeneracy, n_cds, len(positions)
+        return degeneracy, syn_pairs, n_cds, len(positions)
     remaining_pos = np.asarray(remaining_pos, dtype=np.int64)
     if remaining_pos.shape[0] != n_sites or \
             (n_sites and remaining_pos.max() >= n_orig):
         LOG.warning('%s: kept positions do not match the alignment.' % clade)
         return None
-    return degeneracy[remaining_pos], n_cds, len(positions)
+    return (degeneracy[remaining_pos], syn_pairs[remaining_pos], n_cds,
+            len(positions))
 
 
 def polymorphism_rate(x=None, cov=None, maf=None, median_depth=None,
@@ -569,6 +611,113 @@ def polymorphism_rate(x=None, cov=None, maf=None, median_depth=None,
                 polymorphism_rate=rate)
 
 
+def nucleotide_diversity_ratio(x, degeneracy, syn_pairs, cov=None,
+                               n_alleles=None, min_cov=2,
+                               min_allele_count=4, min_allele_freq=0.01):
+    """
+    Within-sample nucleotide diversity ratios of Schloissnig et al. 2013
+    (Nature 493:45): pi(N)/pi(S), the nucleotide diversity analogue of
+    pN/pS, and pi(non-degenerate sites)/pi(fourfold degenerate sites),
+    which depends less on the mutation spectrum (transition/transversion
+    ratio).
+
+    Per site i, pi_i is the probability that two reads drawn without
+    replacement differ, sum_{a<b} 2 n_a n_b / (D (D - 1)). Each allele pair
+    (a, b) is classified as synonymous or non-synonymous from the reference
+    codon context, so pi_i = pi_S,i + pi_N,i. Diversity is normalised by
+    the number of sites of each class (Nei & Gojobori 1986): a position of
+    degeneracy d contributes (d - 1) / 3 synonymous and (4 - d) / 3
+    non-synonymous sites, so
+        pi(S) = sum_i pi_S,i / sum_i (d_i - 1) / 3,
+        pi(N) = sum_i pi_N,i / sum_i (4 - d_i) / 3,
+        pi(nondeg) = mean pi_i over d_i == 1,  pi(4fold) = over d_i == 4,
+    over coding sites (degeneracy > 0) with depth >= min_cov.
+
+    As for Schloissnig's SNP calls, a non-dominant allele only counts if it
+    is supported by >= min_allele_count reads and has a frequency
+    >= min_allele_freq; other non-dominant reads are discarded.
+
+    Pre-calculated statistics are used when supplied:
+        cov:       (n_samples, n_sites) depth, x.sum(axis=2)
+        n_alleles: (n_samples, n_sites) number of observed alleles;
+                   diversity is only computed at sites with > 1 allele
+                   (pi == 0 elsewhere), so x is only read there.
+
+    Args:
+        x: (n_samples, n_sites, 4) allele counts.
+        degeneracy, syn_pairs: (n_sites,) arrays from clade_site_annotation.
+    Returns:
+        dict of (n_samples,) arrays: pi_syn, pi_nonsyn, pi_n_pi_s,
+        pi_nondeg, pi_4fold, pi_nondeg_pi_4fold (ratios NaN if the
+        denominator diversity is 0 or nothing was evaluable).
+    """
+    if cov is None or n_alleles is None:
+        cov_x, _, n_alleles_x = _site_summaries(x)
+        cov = cov_x if cov is None else cov
+        n_alleles = n_alleles_x if n_alleles is None else n_alleles
+    n_samples = cov.shape[0]
+    degeneracy = np.asarray(degeneracy)
+    coding = degeneracy > 0
+
+    with np.errstate(invalid='ignore'):
+        evaluable = coding[None, :] & (cov >= max(min_cov, 2))
+
+    # number of sites per class and sample (Nei-Gojobori site counts)
+    # (masked row sums: no (n_samples, n_sites) float temporaries)
+    def row_sum(weights):
+        w = np.broadcast_to(weights, evaluable.shape)
+        return np.sum(w, axis=1, where=evaluable)
+
+    deg_f = degeneracy.astype(np.float64)
+    syn_sites = row_sum(np.where(coding, (deg_f - 1) / 3, 0.))
+    nonsyn_sites = row_sum(np.where(coding, (4 - deg_f) / 3, 0.))
+    n_nondeg = row_sum((degeneracy == 1).astype(np.float64))
+    n_4fold = row_sum((degeneracy == 4).astype(np.float64))
+
+    # diversity at evaluable multi-allelic sites only
+    rows, cols = np.nonzero(evaluable & (n_alleles > 1))
+    counts = np.asarray(x[rows, cols], dtype=np.float64)
+    depth = counts.sum(axis=1, keepdims=True)
+    dominant = counts.argmax(axis=1)
+    alt = np.ones_like(counts, dtype=bool)
+    alt[np.arange(len(dominant)), dominant] = False
+    with np.errstate(divide='ignore', invalid='ignore'):
+        weak = alt & ((counts < min_allele_count) |
+                      (counts / depth < min_allele_freq))
+    counts[weak] = 0.
+    depth = counts.sum(axis=1)
+
+    pair_pi = np.stack([counts[:, a] * counts[:, b]
+                        for a, b in _ALLELE_PAIRS], axis=1)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        pair_pi *= np.where(depth > 1, 2. / (depth * (depth - 1)), 0.)[:, None]
+    is_syn = ((syn_pairs[cols][:, None] >> np.arange(6, dtype=np.uint8)) & 1
+              ).astype(bool)
+    pi_s_site = np.where(is_syn, pair_pi, 0.).sum(axis=1)
+    pi_n_site = np.where(is_syn, 0., pair_pi).sum(axis=1)
+    pi_site = pi_s_site + pi_n_site
+    del counts, pair_pi, is_syn
+
+    def per_sample(weights, keep=None):
+        if keep is not None:
+            return np.bincount(rows[keep], weights=weights[keep],
+                               minlength=n_samples)
+        return np.bincount(rows, weights=weights, minlength=n_samples)
+
+    site_deg = degeneracy[cols]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        pi_syn = per_sample(pi_s_site) / syn_sites
+        pi_nonsyn = per_sample(pi_n_site) / nonsyn_sites
+        pi_nondeg = per_sample(pi_site, site_deg == 1) / n_nondeg
+        pi_4fold = per_sample(pi_site, site_deg == 4) / n_4fold
+        pi_n_pi_s = np.where(pi_syn > 0, pi_nonsyn / pi_syn, np.nan)
+        pi_nondeg_pi_4fold = np.where(pi_4fold > 0, pi_nondeg / pi_4fold,
+                                      np.nan)
+    return dict(pi_syn=pi_syn, pi_nonsyn=pi_nonsyn, pi_n_pi_s=pi_n_pi_s,
+                pi_nondeg=pi_nondeg, pi_4fold=pi_4fold,
+                pi_nondeg_pi_4fold=pi_nondeg_pi_4fold)
+
+
 def aln2stats(args):
 
     # if exists, skip
@@ -602,10 +751,11 @@ def aln2stats(args):
                              args['clade'] + '.pos.txt')
     remaining_pos = np.loadtxt(kept_file, dtype=np.int64, ndmin=1) \
         if exists(kept_file) else None
-    site_deg = clade_site_degeneracy(args['marker_dir'], args['clade'],
-                                     x.shape[1], remaining_pos)
-    if site_deg is not None:
-        site_deg, n_cds, n_markers = site_deg
+    site_deg = syn_pairs = None
+    annotation = clade_site_annotation(args['marker_dir'], args['clade'],
+                                       x.shape[1], remaining_pos)
+    if annotation is not None:
+        site_deg, syn_pairs, n_cds, n_markers = annotation
         LOG.debug('%s: %s of %s markers usable as in-frame CDS.' %
                   (args['clade'], n_cds, n_markers))
 
@@ -620,6 +770,20 @@ def aln2stats(args):
     else:
         average_nucleotide_diversity = nucleotide_diversity(x)
         theta_w = watterson_theta(x, min_count=2)
+
+    # stats: nucleotide diversity ratios pi(N)/pi(S) and
+    # pi(non-degenerate)/pi(fourfold) (Schloissnig et al. 2013). Reads x
+    # only at multi-allelic coding sites; with dominant variants only there
+    # are none, so all diversities are 0 and the ratios NaN.
+    pi_keys = ('pi_syn', 'pi_nonsyn', 'pi_n_pi_s', 'pi_nondeg', 'pi_4fold',
+               'pi_nondeg_pi_4fold')
+    if site_deg is not None:
+        pi_ratios = nucleotide_diversity_ratio(
+            x, site_deg, syn_pairs, cov=cov,
+            n_alleles=(dom > 0).astype(np.int8) if args['dominant_variants']
+            else n_alleles)
+    else:
+        pi_ratios = {k: np.full(x.shape[0], np.nan) for k in pi_keys}
     del x
 
     if args['dominant_variants']:
@@ -737,7 +901,8 @@ def aln2stats(args):
         prate_4d['n_polymorphic'], prate_4d['n_sites_eval'],
         prate_4d['polymorphism_rate'],
         prate_1d['n_polymorphic'], prate_1d['n_sites_eval'],
-        prate_1d['polymorphism_rate']
+        prate_1d['polymorphism_rate'],
+        *[pi_ratios[k] for k in pi_keys]
     ])
     df = df.T
     df.columns = [
@@ -754,7 +919,7 @@ def aln2stats(args):
         'n_poly_intermediate_syn', 'n_sites_depth_ok_syn',
         'polymorphism_rate_syn',
         'n_poly_intermediate_nonsyn', 'n_sites_depth_ok_nonsyn',
-        'polymorphism_rate_nonsyn'
+        'polymorphism_rate_nonsyn', *pi_keys
     ]
 
     # write df to file
