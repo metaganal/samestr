@@ -8,7 +8,7 @@ import pandas as pd
 from scipy import stats
 
 from samestr.utils.utilities import load_numpy_file
-from samestr.utils import clade_path
+from samestr.utils.file_mapping import clade_path
 from samestr.filter.filter_freqs import read_marker_positions
 
 LOG = logging.getLogger(__name__)
