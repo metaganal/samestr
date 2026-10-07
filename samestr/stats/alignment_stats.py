@@ -1,5 +1,6 @@
 
 import os
+import gzip
 from os.path import basename, exists
 import logging
 import numpy as np
@@ -7,6 +8,8 @@ import pandas as pd
 from scipy import stats
 
 from samestr.utils.utilities import load_numpy_file
+from samestr.utils import clade_path
+from samestr.filter.filter_freqs import read_marker_positions
 
 LOG = logging.getLogger(__name__)
 
@@ -374,6 +377,198 @@ def tajimas_d(k, S, n):
     return (k - S / a1) / np.sqrt(e1 * S + e2 * S * (S - 1))
 
 
+# --------------------------------------------------------------------------
+# Within-host polymorphism rate (Garud et al. 2019, PLoS Biol;
+# Madi et al. 2023, eLife 12:e78530)
+#
+#   "The polymorphism rate of a species in a sample was computed as the
+#    proportion of synonymous sites in core genes with intermediate allele
+#    frequencies (0.2 <= f <= 0.8)."
+#
+# with sites excluded if D < 0.3 * Dbar or D > 3 * Dbar (Dbar: median depth
+# at protein coding sites with nonzero coverage) and samples excluded if
+# Dbar < 5. Synonymous = fourfold degenerate, nonsynonymous = onefold
+# degenerate sites. Clade markers stand in for the paper's core genes
+# (species-specific, single-copy coding genes, i.e. also free of genes shared
+# between species which the paper blacklists).
+# --------------------------------------------------------------------------
+
+_BASES = 'ACGT'
+_AMINO = ('KNKNTTTTRSRSIIMIQHQHPPPPRRRRLLLLEDEDAAAAGGGGVVVV*Y*YSSSS*CWCLFLF')
+_CODON_AA = {a + b + c: _AMINO[16 * i + 4 * j + k]
+             for i, a in enumerate(_BASES) for j, b in enumerate(_BASES)
+             for k, c in enumerate(_BASES)}  # standard / bacterial (table 11)
+
+
+def _codon_degeneracy():
+    """(64, 3) int8 table: for codon index 16*i + 4*j + k (ACGT order) and
+    codon position, the number of nucleotides (incl. the reference) that
+    encode the same amino acid (4 = fourfold degenerate/synonymous, 1 =
+    onefold degenerate/nonsynonymous). Stop codons get 0."""
+    table = np.zeros((64, 3), dtype=np.int8)
+    for codon, aa in _CODON_AA.items():
+        if aa == '*':
+            continue
+        idx = 16 * _BASES.index(codon[0]) + 4 * _BASES.index(codon[1]) + \
+            _BASES.index(codon[2])
+        for pos in range(3):
+            table[idx, pos] = sum(
+                _CODON_AA[codon[:pos] + b + codon[pos + 1:]] == aa
+                for b in _BASES)
+    return table
+
+
+_DEGENERACY = _codon_degeneracy()
+
+
+def site_degeneracy(seq):
+    """
+    Degeneracy (1-4) of every position of a protein coding sequence, read in
+    frame 0 on the given strand; 0 at codons with non-ACGT bases and at stop
+    codons. Returns None if seq does not look like an in-frame CDS (length
+    not a multiple of 3 or an internal stop codon), so it can be skipped.
+    """
+    seq = str(seq).upper()
+    if len(seq) < 3 or len(seq) % 3:
+        return None
+    lut = np.full(256, -1, dtype=np.int16)
+    for i, b in enumerate(_BASES):
+        lut[ord(b)] = i
+    nt = lut[np.frombuffer(seq.encode(), dtype=np.uint8)].reshape(-1, 3)
+    valid = (nt >= 0).all(axis=1)
+    idx = np.where(valid, 16 * nt[:, 0] + 4 * nt[:, 1] + nt[:, 2], 0)
+    deg = np.where(valid[:, None], _DEGENERACY[idx], 0).astype(np.int8)
+    stop = valid & (deg == 0).all(axis=1)
+    if stop[:-1].any():
+        return None  # internal stop: not in frame 0 / not a CDS
+    return deg.ravel()
+
+
+def _read_fasta_gz(path):
+    """Minimal gzipped FASTA reader -> dict name -> sequence."""
+    seqs, name, chunks = {}, None, []
+    with gzip.open(path, 'rt') as fh:
+        for line in fh:
+            line = line.strip()
+            if line.startswith('>'):
+                if name is not None:
+                    seqs[name] = ''.join(chunks)
+                name, chunks = line[1:].split()[0], []
+            elif line:
+                chunks.append(line)
+    if name is not None:
+        seqs[name] = ''.join(chunks)
+    return seqs
+
+
+def clade_site_degeneracy(marker_dir, clade, n_sites, remaining_pos=None):
+    """
+    Degeneracy per alignment column of a clade, from the SameStr database
+    (`<clade>.markers.fa.gz` + `<clade>.positions.txt.gz`).
+
+    Args:
+        n_sites: number of columns of the alignment.
+        remaining_pos: original positions kept in the alignment (written
+            to `<clade>.pos.txt` by `samestr filter --delete-pos`).
+    Returns:
+        ((n_sites,) int8 degeneracy, 0 = unknown/not coding in frame,
+         number of markers usable as CDS, total number of markers),
+        or None if the database files are missing or do not match.
+    """
+    base = marker_dir + '/' + clade_path(clade, filebase=True)
+    pos_file, fa_file = base + '.positions.txt.gz', base + '.markers.fa.gz'
+    if not (exists(pos_file) and exists(fa_file)):
+        LOG.warning('%s: marker sequences/positions not found at %s.' %
+                    (clade, base))
+        return None
+    positions = read_marker_positions(pos_file)
+    seqs = _read_fasta_gz(fa_file)
+    n_orig = max([end for _, end, _ in positions.values()] + [0])
+    degeneracy = np.zeros(n_orig, dtype=np.int8)
+    n_cds = 0
+    for marker, (start, end, length) in positions.items():
+        seq = seqs.get(marker)
+        if seq is None or len(seq) != length:
+            continue
+        deg = site_degeneracy(seq)
+        if deg is not None:
+            degeneracy[start:end] = deg
+            n_cds += 1
+    if remaining_pos is None:
+        if n_orig != n_sites:
+            LOG.warning('%s: alignment has %s columns but markers span %s '
+                        'positions.' % (clade, n_sites, n_orig))
+            return None
+        return degeneracy, n_cds, len(positions)
+    remaining_pos = np.asarray(remaining_pos, dtype=np.int64)
+    if remaining_pos.shape[0] != n_sites or \
+            (n_sites and remaining_pos.max() >= n_orig):
+        LOG.warning('%s: kept positions do not match the alignment.' % clade)
+        return None
+    return degeneracy[remaining_pos], n_cds, len(positions)
+
+
+def polymorphism_rate(x=None, cov=None, maf=None, median_depth=None,
+                      site_mask=None, f_min=0.2, f_max=0.8,
+                      min_median_depth=5, depth_low=0.3, depth_high=3.):
+    """
+    Within-host polymorphism rate per sample (Garud et al. 2019; Madi et al.
+    2023): the fraction of evaluable sites with an intermediate allele
+    frequency f_min <= f <= f_max.
+
+    A site is evaluable in a sample if it is in site_mask (e.g. fourfold
+    degenerate sites of core genes) and its depth D satisfies
+        depth_low * Dbar <= D <= depth_high * Dbar,
+    where Dbar is the sample's median depth over covered sites. Samples with
+    Dbar < min_median_depth are excluded (NaN).
+
+    f is the frequency of the non-dominant alleles, (D - D_dom) / D, i.e.
+    the minor allele frequency at bi-allelic sites (MIDAS' alt-allele
+    frequency in [0.2, 0.8] is symmetric, so equivalent there).
+
+    Pre-calculated statistics are used when supplied, so x is not needed:
+        cov:          (n_samples, n_sites) depth, x.sum(axis=2)
+        maf:          (n_samples, n_sites) (cov - dom) / cov
+        median_depth: (n_samples,) median depth over covered sites
+    Anything missing is derived from x (n_samples, n_sites, 4).
+
+    Args:
+        site_mask: optional (n_sites,) bool array of sites to consider.
+    Returns:
+        dict of (n_samples,) arrays: n_polymorphic, n_sites_eval,
+        polymorphism_rate (NaN for excluded samples / no evaluable sites).
+    """
+    if cov is None or maf is None:
+        if x is None:
+            raise ValueError('Either x or both cov and maf are required.')
+        cov_x, dom_x, _ = _site_summaries(x)
+        if cov is None:
+            cov = cov_x
+        if maf is None:
+            with np.errstate(divide='ignore', invalid='ignore'):
+                maf = (cov_x - dom_x) / cov_x
+    if median_depth is None:
+        median_depth = _masked_row_median(cov, cov > 0)
+    median_depth = np.asarray(median_depth, dtype=np.float64)
+
+    with np.errstate(invalid='ignore'):
+        lo = (depth_low * median_depth)[:, None]
+        hi = (depth_high * median_depth)[:, None]
+        evaluable = (cov > 0) & (cov >= lo) & (cov <= hi)
+        if site_mask is not None:
+            evaluable &= np.asarray(site_mask, dtype=bool)[None, :]
+        polymorphic = evaluable & (maf >= f_min) & (maf <= f_max)
+
+    n_eval = evaluable.sum(axis=1)
+    n_poly = polymorphic.sum(axis=1)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        rate = np.where(n_eval > 0, n_poly / n_eval, np.nan)
+    excluded = ~(median_depth >= min_median_depth)  # also NaN medians
+    rate[excluded] = np.nan
+    return dict(n_polymorphic=n_poly, n_sites_eval=n_eval,
+                polymorphism_rate=rate)
+
+
 def aln2stats(args):
 
     # if exists, skip
@@ -399,6 +594,20 @@ def aln2stats(args):
     # sum == max and n_alleles == (max > 0). Hence consensus() itself, a full
     # copy of x plus a python loop over tied sites, is not needed here.
     cov, dom, n_alleles = _site_summaries(x)
+
+    # site degeneracy from the marker sequences (for synonymous/fourfold and
+    # nonsynonymous/onefold polymorphism rates). `samestr filter
+    # --delete-pos` stores the kept original positions next to its output.
+    kept_file = os.path.join(os.path.dirname(args['input_file']),
+                             args['clade'] + '.pos.txt')
+    remaining_pos = np.loadtxt(kept_file, dtype=np.int64, ndmin=1) \
+        if exists(kept_file) else None
+    site_deg = clade_site_degeneracy(args['marker_dir'], args['clade'],
+                                     x.shape[1], remaining_pos)
+    if site_deg is not None:
+        site_deg, n_cds, n_markers = site_deg
+        LOG.debug('%s: %s of %s markers usable as in-frame CDS.' %
+                  (args['clade'], n_cds, n_markers))
 
     # stats: within-sample nucleotide diversity and Watterson's theta
     # (per site, over sites with depth >= 2). Needs the full allele counts,
@@ -497,7 +706,21 @@ def aln2stats(args):
         # at polymorphic sites
         mean_maf_polysites = _row_sum_mean(maf, poly, n_poly)
         median_maf_polysites = _masked_row_median(maf, poly)
-        del maf
+
+    # stats: within-host polymorphism rate (Garud et al. 2019; Madi et al.
+    # 2023) from the precomputed depth, MAF and median depth: all marker
+    # sites, synonymous (fourfold degenerate) and nonsynonymous (onefold
+    # degenerate) sites. NaN if the degeneracy could not be determined.
+    prate = polymorphism_rate(cov=cov, maf=maf, median_depth=median_cov)
+    nan = np.full(n_samples, np.nan)
+    prate_4d = prate_1d = dict(n_polymorphic=nan, n_sites_eval=nan,
+                               polymorphism_rate=nan)
+    if site_deg is not None:
+        prate_4d = polymorphism_rate(cov=cov, maf=maf, median_depth=median_cov,
+                                     site_mask=site_deg == 4)
+        prate_1d = polymorphism_rate(cov=cov, maf=maf, median_depth=median_cov,
+                                     site_mask=site_deg == 1)
+    del maf
 
     # convert to pandas df
     df = pd.DataFrame(data=[
@@ -508,7 +731,13 @@ def aln2stats(args):
         mean_f_dom_cov_polysites, median_f_dom_cov_polysites,
         mean_cov_polysites, n_binom, f_binom, n_binom_segata, f_binom_segata,
         average_nucleotide_diversity, theta_w, mean_maf, median_maf,
-        mean_maf_polysites, median_maf_polysites
+        mean_maf_polysites, median_maf_polysites,
+        prate['n_polymorphic'], prate['n_sites_eval'],
+        prate['polymorphism_rate'],
+        prate_4d['n_polymorphic'], prate_4d['n_sites_eval'],
+        prate_4d['polymorphism_rate'],
+        prate_1d['n_polymorphic'], prate_1d['n_sites_eval'],
+        prate_1d['polymorphism_rate']
     ])
     df = df.T
     df.columns = [
@@ -520,7 +749,12 @@ def aln2stats(args):
         'median_f_dom_cov_polysites', 'mean_cov_polysites', 'n_binom',
         'f_binom', 'n_binom_segata', 'f_binom_segata',
         'average_nucleotide_diversity', 'watterson_theta', 'mean_maf',
-        'median_maf', 'mean_maf_polysites', 'median_maf_polysites'
+        'median_maf', 'mean_maf_polysites', 'median_maf_polysites',
+        'n_poly_intermediate', 'n_sites_depth_ok', 'polymorphism_rate',
+        'n_poly_intermediate_syn', 'n_sites_depth_ok_syn',
+        'polymorphism_rate_syn',
+        'n_poly_intermediate_nonsyn', 'n_sites_depth_ok_nonsyn',
+        'polymorphism_rate_nonsyn'
     ]
 
     # write df to file
