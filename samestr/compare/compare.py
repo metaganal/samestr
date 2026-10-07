@@ -1,9 +1,11 @@
 
+import itertools
 import logging
 import os
 from os.path import basename, exists
 
 import numpy as np
+from scipy import sparse
 from Bio import Seq, SeqRecord, AlignIO
 from Bio.Align import MultipleSeqAlignment
 
@@ -12,6 +14,95 @@ from samestr.filter import consensus
 
 
 LOG = logging.getLogger(__name__)
+
+# allele subsets with >= 2 members, used for the inclusion-exclusion correction
+_MULTI_SUBSETS = [s for k in range(2, 5) for s in itertools.combinations(range(4), k)]
+
+
+def pairwise_counts(x, chunk=None):  # chunk unused (chunking disabled)
+    """
+    All-vs-all counts over the alignment positions of x (n_samples, n_pos, 4):
+
+    shared[i, j]  = number of positions where i and j share at least one allele
+    overlap[i, j] = number of positions covered in both i and j
+
+    Computed with matrix products instead of an O(n) python loop over samples:
+
+      overlap = C @ C.T                   C = coverage, (n, L)
+      shared  = A @ A.T - correction      A = allele presence, flattened (n, 4L)
+
+    A @ A.T counts every shared allele, so a position where two samples share
+    k > 1 alleles is counted k times. The exact correction follows from
+    inclusion-exclusion, 1[any shared] = sum_S (-1)^(|S|+1) prod_{a in S},
+    whose |S| >= 2 terms are non-zero only at multi-allelic sites and are
+    therefore computed as sparse products.
+
+    Chunking over positions is disabled (memory assumed ample, <= 512 GB):
+    the whole alignment is processed in one pass. float32 GEMMs on 0/1 data
+    are exact while n_pos < 2**24; float64 is used beyond that.
+    Peak memory ~ x itself + ~25 bytes * n * n_pos + ~20 bytes * n**2.
+    """
+    n, n_pos, _ = x.shape
+    shared = np.zeros((n, n), dtype=np.float64)
+    overlap = np.zeros((n, n), dtype=np.float64)
+    gemm_dtype = np.float32 if n_pos < 2 ** 24 else np.float64
+
+    # chunked variant (bounds memory to O(n * chunk)); re-enable if needed:
+    # for lo in range(0, n_pos, chunk):
+    #     a = x[:, lo:lo + chunk] > 0
+    #     ... (body below, indented)
+    a = x > 0                                           # (n, L, 4) bool
+    n_alleles = a.sum(axis=2, dtype=np.int8)            # (n, L)
+
+    cov = np.ascontiguousarray(n_alleles > 0, dtype=gemm_dtype)
+    overlap += cov @ cov.T                              # SYRK
+    del cov
+
+    flat = a.reshape(n, -1).astype(gemm_dtype)          # (n, 4L)
+    shared += flat @ flat.T                             # SYRK
+    del flat
+
+    if (n_alleles > 1).any():
+        for s in _MULTI_SUBSETS:
+            b = sparse.csr_matrix(a[:, :, list(s)].all(axis=2), dtype=np.float64)
+            if b.nnz:
+                sign = 1 if len(s) % 2 else -1
+                shared += sign * (b @ b.T).toarray()
+
+    # values are exact integers <= n_pos; int32 halves the output footprint
+    return shared.astype(np.int32), overlap.astype(np.int32)
+
+
+def _write_matrix(path, samples, mat):
+    with open(path, 'w') as out:
+        out.write('Sample\t' + '\t'.join(samples) + '\n')
+        # convert one row at a time: avoids a full python-object copy of mat
+        for sample, row in zip(samples, mat):
+            out.write(sample + '\t' + '\t'.join(map(str, row.tolist())) + '\n')
+
+
+def _dominant_msa(d, samples):
+    """Vectorized conversion of dominant-variant frequencies to sequences."""
+    present = d > 0                                         # (n, L, 4)
+    n_alleles = present.sum(axis=2)
+    idx = present.argmax(axis=2)                            # first present allele
+
+    # consensus() leaves at most one allele per site; if not, pick randomly
+    multi = n_alleles > 1
+    if multi.any():
+        r = np.random.random((int(multi.sum()), 4))
+        r[~present[multi]] = -1
+        idx[multi] = r.argmax(axis=1)
+
+    idx[n_alleles == 0] = 4                                 # gap
+    lut = np.frombuffer(b'ACGT-', dtype='S1')
+    seqs = lut[idx]                                         # (n, L) bytes
+
+    return MultipleSeqAlignment([
+        SeqRecord.SeqRecord(id=s, description=s,
+                            seq=Seq.Seq(row.tobytes().decode('ascii')))
+        for s, row in zip(samples, seqs)
+    ])
 
 
 def compare(args):
@@ -35,18 +126,6 @@ def compare(args):
 
     # load freqs
     x = load_numpy_file(args['input_file'])
-    np.seterr(divide='ignore', invalid='ignore')
-
-    # conversion arrays
-    acgt = '-NACGT'
-    n_freq = [
-        [0, 0, 0, 0],  # -
-        [0, 0, 0, 0],  # N
-        [1, 0, 0, 0],  # A
-        [0, 1, 0, 0],  # C
-        [0, 0, 1, 0],  # G
-        [0, 0, 0, 1],  # T
-    ]
 
     # rename samples to samples.dom
     if args['dominant_variants'] or args['dominant_variants_added']:
@@ -63,30 +142,13 @@ def compare(args):
         x = np.append(x, d, axis=0)
         samples += dom_samples
 
-    closest_out = open('%s/%s.closest.txt' % (args['output_dir'], args['clade']), 'w')
-    overlap_out = open('%s/%s.overlap.txt' % (args['output_dir'], args['clade']), 'w')
-    fraction_out = open('%s/%s.fraction.txt' % (args['output_dir'], args['clade']), 'w')
+    shared, overlap = pairwise_counts(x)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        fraction = np.nan_to_num(shared / overlap)
 
-    with closest_out, overlap_out, fraction_out:
-        print("Sample", *samples, sep="\t", file=closest_out)
-        print("Sample", *samples, sep="\t", file=overlap_out)
-        print("Sample", *samples, sep="\t", file=fraction_out)
-
-        non_null_global = (x > 0)
-        non_null_positions = (x.sum(axis=2) > 0)
-
-        for i, (sample, sample_matrix) in enumerate(zip(samples, x)):
-            LOG.debug("Processing sample %s (%s/%s)...", sample, i + 1, len(samples))
-            shortest_distance = (((sample_matrix > 0) *
-                                  non_null_global).sum(axis=2) > 0).sum(axis=1)
-            shared_overlap = ((sample_matrix.sum(axis=1) > 0) *
-                              non_null_positions).sum(axis=1)
-            fraction_phenotype = np.nan_to_num(shortest_distance / shared_overlap)
-
-            print(sample, *shortest_distance, sep="\t", file=closest_out)
-            print(sample, *shared_overlap, sep="\t", file=overlap_out)
-            print(sample, *fraction_phenotype, sep="\t", file=fraction_out)
-
+    _write_matrix('%s/%s.closest.txt' % (args['output_dir'], args['clade']), samples, shared)
+    _write_matrix('%s/%s.overlap.txt' % (args['output_dir'], args['clade']), samples, overlap)
+    _write_matrix('%s/%s.fraction.txt' % (args['output_dir'], args['clade']), samples, fraction)
 
     # output dominant variants as msa
     if 'dominant_variants_msa' in args and args['dominant_variants_msa']:
@@ -96,25 +158,7 @@ def compare(args):
         else:
             d = consensus(x)
 
-        # convert seqs to Bio SeqIO alignment object
-        seqs_list = []
-        for idx, freqs in enumerate((d > 0).astype(int).tolist()):
-            seq = []
-            for freq in freqs:
-                try:
-                    seq.append(acgt[n_freq.index(freq)])
-                except ValueError:
-                    max_idx = np.array([
-                        i for i in range(0, len(freq)) if freq[i] == max(freq)
-                    ])
-                    random_max = np.random.choice(
-                        max_idx, 1)[0] + 2  # for - and N in n_freq
-                    seq.append(acgt[random_max])
-            seqs_list.append(
-                SeqRecord.SeqRecord(id=samples[idx],
-                                    description=samples[idx],
-                                    seq=Seq.Seq(''.join(seq))))
-        seqs_msa = MultipleSeqAlignment(seqs_list)
+        seqs_msa = _dominant_msa(d, samples)
 
         # write alignment fasta
         msa_filename = os.path.join(args['output_dir'], args['clade'] + '.msa.fa')

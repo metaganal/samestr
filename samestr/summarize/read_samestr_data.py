@@ -53,6 +53,19 @@ def distmat_to_long(distmat, value_name):
     return distmat
 
 
+def upper_pair_indices(labels):
+    """
+    Positional indices (i, j) of all label pairs with labels[i] < labels[j],
+    in the same order as `long[long['row'] < long['col']]` after stacking a
+    square matrix whose index and columns are both `labels` (row-major).
+    Comparing integer ranks of the labels replaces an n**2-row string
+    comparison; equal labels share a rank, so they are excluded as with '<'.
+    """
+    _, rank = np.unique(np.asarray(labels, dtype=object), return_inverse=True)
+    rank = rank.ravel()
+    return np.nonzero(rank[:, None] < rank[None, :])
+
+
 def get_merged_distmats(directory, clade):
     """
     Takes directory and clade as input
@@ -70,7 +83,28 @@ def get_merged_distmats(directory, clade):
     distmat = distmat_nonfinite_to_NA(distmat)
     overlap = distmat_nonfinite_to_NA(overlap)
 
-    # Convert wide to long format
+    # Fast path: both matrices share labels (always true for samestr compare
+    # output). Pick the row < col pairs directly from the arrays instead of
+    # stacking two n x n matrices to long format and joining them on string keys.
+    labels = distmat.index
+    if (labels.equals(distmat.columns) and labels.equals(overlap.index)
+            and labels.equals(overlap.columns)):
+        sim_mat = distmat.to_numpy()
+        ov_mat = overlap.to_numpy()
+        # stack() drops NaN; the original returns None if either side is all-NaN
+        if not (pd.notna(sim_mat).any() and pd.notna(ov_mat).any()):
+            return None
+        i, j = upper_pair_indices(labels)
+        sim, ov = sim_mat[i, j], ov_mat[i, j]
+        # outer join of the two stacked frames: keep pairs present in either
+        keep = pd.notna(sim) | pd.notna(ov)
+        if not keep.all():
+            i, j, sim, ov = i[keep], j[keep], sim[keep], ov[keep]
+        lab = np.asarray(labels, dtype=object)
+        return pd.DataFrame({'row': lab[i], 'col': lab[j],
+                             'similarity': sim, 'overlap': ov, 'clade': clade})
+
+    # Generic path: convert wide to long format and join
     distmat_long = distmat_to_long(distmat, value_name='similarity')
     overlap_long = distmat_to_long(overlap, value_name='overlap')
     if distmat_long.shape[0] > 0 and overlap_long.shape[0] > 0:
@@ -99,12 +133,14 @@ def read_samestr_data(sstr_dir):
         set(distance_clade_list))
 
     LOG.info(f'Merging matrix for {len(clade_intersect)} clades.')
-    sstr_data = pd.DataFrame()
-    for clade in clade_intersect:
-        sstr_data = pd.concat(
-            [sstr_data, get_merged_distmats(directory=sstr_dir, clade=clade)])
-
-    return sstr_data
+    # collect, then concatenate once (concat inside the loop re-copies all
+    # previously read clades on every iteration: quadratic in the clade count)
+    frames = [get_merged_distmats(directory=sstr_dir, clade=clade)
+              for clade in clade_intersect]
+    frames = [f for f in frames if f is not None]
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames)
 
 
 def analyze_strain_events(sstr_data, similarity_threshold=0.999, overlap_threshold=5000):
@@ -113,13 +149,17 @@ def analyze_strain_events(sstr_data, similarity_threshold=0.999, overlap_thresho
     Also returns a data frame with the sum of strain co-occurrences
     across all clades for each file pair, including zero counts.
     """
-    sstr_data['analysis_level'] = sstr_data.apply(
-        lambda x: 'strain-level' if x['overlap'] > overlap_threshold else 'clade-level', axis=1)
-    sstr_data['analyzed_strain'] = sstr_data['analysis_level'] == 'strain-level'
-    sstr_data['shared_strain'] = (sstr_data['similarity'] >= similarity_threshold) & (
-        sstr_data['analyzed_strain'] == True)
-    sstr_data['event'] = sstr_data.apply(lambda x: 'shared_strain' if x['shared_strain']
-                                         else 'other_strain' if x['overlap'] > overlap_threshold else 'same_clade', axis=1)
+    # vectorized (row-wise .apply is a python call per pair and clade)
+    strain_level = (sstr_data['overlap'] > overlap_threshold).to_numpy()
+    shared = (sstr_data['similarity'] >= similarity_threshold).to_numpy() & strain_level
+    # labels as categoricals: no per-row python string objects; written identically
+    sstr_data['analysis_level'] = pd.Categorical.from_codes(
+        strain_level.astype(np.int8), ['clade-level', 'strain-level'])
+    sstr_data['analyzed_strain'] = strain_level
+    sstr_data['shared_strain'] = shared
+    sstr_data['event'] = pd.Categorical.from_codes(
+        np.where(shared, 2, strain_level).astype(np.int8),
+        ['same_clade', 'other_strain', 'shared_strain'])
     sstr_data = sstr_data[['row', 'col', 'clade', 'similarity', 'overlap',
                            'analysis_level', 'analyzed_strain', 'shared_strain', 'event']]
 

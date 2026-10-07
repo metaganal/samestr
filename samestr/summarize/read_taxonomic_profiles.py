@@ -6,6 +6,8 @@ import re
 
 import logging
 
+from samestr.summarize.read_samestr_data import upper_pair_indices
+
 LOG = logging.getLogger(__name__)
 
 
@@ -203,8 +205,9 @@ def binarize_taxonomic_profile(df):
     """
     Take a taxonomic profile dataframe and return a binary dataframe
     """
-    # convert to binary > numeric
-    return df.applymap(lambda x: int(bool(x)))
+    # convert to binary > numeric; same as applymap(lambda x: int(bool(x)))
+    # (NaN is truthy, hence != 0), without a python call per cell
+    return (df != 0).astype(np.int64)
 
 
 def get_taxon_cooccurrence(wide_taxonomic_profile):
@@ -217,8 +220,10 @@ def get_taxon_cooccurrence(wide_taxonomic_profile):
     # convert to binary > numeric, index on first column
     df = binarize_taxonomic_profile(wide_taxonomic_profile)
 
-    # calculate co-occurrence
-    cooc = np.dot(df.T, df)
+    # calculate co-occurrence; float64 matmul runs on BLAS (numpy's integer
+    # matmul does not) and is exact for counts < 2**53
+    values = df.to_numpy(dtype=np.float64)
+    cooc = (values.T @ values).astype(np.int64)
 
     # convert to long format
     cooc_long = pd.DataFrame(cooc, columns=df.columns,
@@ -246,7 +251,14 @@ def get_taxon_cooccurrences(wide_taxonomic_profile, db_taxonomy):
     # get the available taxonomic levels from db_taxonomy header
     tax_levels = db_taxonomy.columns
     sample_cols = [col for col in df_full.columns if col not in tax_levels]
-    coocs = []
+    # Sample pairs with row < col, computed once for all taxonomic levels;
+    # each level's co-occurrence matrix is then read at those positions.
+    # Equivalent to stacking every level's n x n matrix to long format and
+    # outer-merging the levels on string keys, without either step.
+    labels = pd.Index(sample_cols)
+    i, j = upper_pair_indices(labels)
+    lab = np.asarray(labels, dtype=object)
+    cooc = pd.DataFrame({'row': lab[i], 'col': lab[j]})
 
     for tax_level in tax_levels:
 
@@ -254,19 +266,15 @@ def get_taxon_cooccurrences(wide_taxonomic_profile, db_taxonomy):
 
         # groupsum the dataframe to the specified taxonomic level
         df = df_tax_level.groupby(tax_level).sum(numeric_only=True)
+        # a sample dropped by numeric_only got 0 via the outer merge + fillna(0)
+        if list(df.columns) != sample_cols:
+            df = df.reindex(columns=sample_cols, fill_value=0)
 
-        cooc = get_taxon_cooccurrence(df)
-        # renaming the cooc column to include the taxonomic level
-        cooc.rename(columns={'cooc': 'shared_' + tax_level}, inplace=True)
+        # co-occurrence matrix (samples x samples), see get_taxon_cooccurrence
+        values = binarize_taxonomic_profile(df).to_numpy(dtype=np.float64)
+        cooc_mat = (values.T @ values).astype(np.int64)
+        cooc['shared_' + tax_level] = cooc_mat[i, j]
 
-        # get the cooccurrence
-        coocs += [cooc]
-
-    # merge the cooccurrence dataframes by row, col,
-    # and fill in the missing values with 0
-    cooc = reduce(lambda left, right: pd.merge(left, right, on=[
-                  'row', 'col'], how='outer'), coocs).fillna(0)
-    
     LOG.debug(cooc)
 
     return cooc

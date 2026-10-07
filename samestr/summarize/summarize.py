@@ -3,6 +3,7 @@ from os.path import exists
 from os import makedirs
 import logging
 import glob
+import re
 
 from samestr.summarize.read_taxonomic_profiles import get_clade_profile, get_taxon_counts, get_taxon_cooccurrences
 from samestr.summarize.read_samestr_data import read_samestr_data, analyze_strain_events
@@ -52,6 +53,19 @@ def summarize(args):
     sstr_data, strain_cooc = analyze_strain_events(sstr_data,
                                                    overlap_threshold=args['aln_pair_min_overlap'],
                                                    similarity_threshold=args['aln_pair_min_similarity'])
+
+    # strip the taxonomic profile extension (or longest matching prefix of it) from
+    # the strain sample names so they match the taxon cooccurrence sample names.
+    # e.g. extension '.mp4.txt' -> strain names ending in '.mp4' become the base name.
+    extension = args['tax_profiles_extension']
+    if extension and not strain_cooc.empty:
+        prefixes = (re.escape(extension[:i]) for i in range(len(extension), 0, -1))
+        ext_regex = re.compile('(?:' + '|'.join(prefixes) + r')$')
+        # apply the regex once per distinct sample name, not once per pair
+        for c in ('row', 'col'):
+            codes, uniques = pd.factorize(strain_cooc[c].astype(str))
+            stripped = pd.Index(uniques).str.replace(ext_regex, '', regex=True)
+            strain_cooc[c] = np.asarray(stripped, dtype=object)[codes]
 
     # merge all data, replace NaN with 0 only in the shared_strains and analyzed_strain column
     cooc_data = pd.merge(taxon_cooc, strain_cooc, on=['row', 'col'], how='outer')
