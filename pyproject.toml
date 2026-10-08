@@ -12,6 +12,7 @@ description = 'SameStr identifies shared strains between pairs of metagenomic sa
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
+dynamic = ["dependencies"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
@@ -20,6 +21,9 @@ classifiers = [
     "Environment :: Console",
     "Natural Language :: English"
 ]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
 
 [project.urls]
 "Homepage" = "https://github.com/danielpodlesny/samestr"
