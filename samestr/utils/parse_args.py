@@ -752,6 +752,60 @@ def read_params():
         'Schloissnig et al. 2013 (and the pi ratios of `samestr stats`); 1 keeps '
         'every read.')
 
+    # FST
+    fst_parser = subparser.add_parser(
+        'fst',
+        formatter_class=ap.ArgumentDefaultsHelpFormatter,
+        help='Calculate pairwise fixation index (Fst) from compare and stats output.')
+    fst_general = fst_parser.add_argument_group('General arguments')
+    fst_general.add_argument(
+        '--marker-dir',
+        required=True,
+        metavar='DIR',
+        type=str,
+        help='Path to MetaPhlAn or mOTUs clade marker database.')
+    fst_input = fst_parser.add_argument_group('Input arguments')
+    fst_input.add_argument(
+        '--compare-dir',
+        required=True,
+        metavar='DIR',
+        type=str,
+        help='Path to `samestr compare` output directory. Must contain '
+             '.pi_within.txt, .pi_between.txt and .pi_sites.txt per clade.')
+    fst_input.add_argument(
+        '--stats-dir',
+        required=False,
+        metavar='DIR',
+        default=None,
+        type=str,
+        help='Path to `samestr stats` output directory (.aln_stats.txt). '
+             'Optional: adds fst_stats, which uses each sample\'s '
+             'average_nucleotide_diversity over its own covered positions.')
+    fst_input.add_argument(
+        '--clade',
+        required=False,
+        metavar='CLADE',
+        nargs='+',
+        type=str,
+        help='Clade(s) to process. Processing all in --compare-dir if not specified.')
+    fst_output = fst_parser.add_argument_group('Output arguments')
+    fst_output.add_argument(
+        '--output-dir',
+        required=False,
+        metavar='DIR',
+        default='out_fst/',
+        type=str,
+        help='Path to output directory.')
+    fst_thresholds = fst_parser.add_argument_group('Threshold arguments')
+    fst_thresholds.add_argument(
+        '--min-sites',
+        required=False,
+        metavar='INT',
+        default=5000,
+        type=int,
+        help='Minimum number of positions a pair must share (at --pi-min-cov '
+             'of `samestr compare`) for Fst to be defined; NaN otherwise.')
+
     # SUMMARIZE
     summarize_parser = subparser.add_parser(
         'summarize',
