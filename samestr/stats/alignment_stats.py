@@ -718,23 +718,46 @@ def nucleotide_diversity_ratio(x, degeneracy, syn_pairs, cov=None,
                 pi_nondeg_pi_4fold=pi_nondeg_pi_4fold)
 
 
-def aln2stats(args):
+#: columns of the per-sample statistics table, in order
+#: (sample_stats / `<clade>.aln_stats.txt`)
+STAT_COLUMNS = (
+    'Sample', 'mean_cov', 'median_cov', 'n_sites', 'n_gaps', 'n_covered',
+    'n_mono', 'n_duo', 'n_tri', 'n_quat', 'n_poly', 'f_covered', 'f_mono',
+    'f_duo', 'f_tri', 'f_quat', 'f_poly', 'mean_dom_cov', 'mean_f_dom_cov',
+    'median_f_dom_cov', 'mean_dom_cov_polysites',
+    'median_dom_cov_polysites', 'mean_f_dom_cov_polysites',
+    'median_f_dom_cov_polysites', 'mean_cov_polysites', 'n_binom',
+    'f_binom', 'n_binom_segata', 'f_binom_segata',
+    'average_nucleotide_diversity', 'watterson_theta', 'mean_maf',
+    'median_maf', 'mean_maf_polysites', 'median_maf_polysites',
+    'n_poly_intermediate', 'n_sites_depth_ok', 'polymorphism_rate',
+    'n_poly_intermediate_syn', 'n_sites_depth_ok_syn',
+    'polymorphism_rate_syn',
+    'n_poly_intermediate_nonsyn', 'n_sites_depth_ok_nonsyn',
+    'polymorphism_rate_nonsyn', 'pi_syn', 'pi_nonsyn', 'pi_n_pi_s',
+    'pi_nondeg', 'pi_4fold', 'pi_nondeg_pi_4fold')
 
-    # if exists, skip
-    output_name = os.path.join(args['output_dir'], basename(args['input_file']))
-    if exists(output_name):
-        LOG.info('Skipping %s. Output file exists.' % args['clade'])
-        return True
 
-    # load sample order
-    with open(args['input_name'], 'r') as file:
-        samples = file.read().strip().split('\n')
+def sample_stats(x, samples, site_deg=None, syn_pairs=None,
+                 dominant_variants=False):
+    """
+    Per-sample alignment statistics of one clade (the table aln2stats
+    writes), from allele counts in memory.
 
-    LOG.info('Gathering stats for %s found in %s samples.' %
-             (args['clade'], len(samples)))
-
-    # load freqs
-    x = load_numpy_file(args['input_file'])
+    Args:
+        x: (n_samples, n_sites, 4) allele counts.
+        samples: (n_samples,) sample names.
+        site_deg, syn_pairs: optional (n_sites,) site annotation from
+            clade_site_annotation; without it the synonymous/nonsynonymous
+            polymorphism rates and the diversity ratios are NaN.
+        dominant_variants: analyze only dominant variants.
+    Returns:
+        pandas DataFrame with one row per sample and columns STAT_COLUMNS.
+    """
+    samples = np.asarray(samples)
+    if samples.shape[0] != x.shape[0]:
+        raise ValueError('%s sample names for %s samples.' %
+                         (samples.shape[0], x.shape[0]))
 
     # Every statistic below depends on x only through three per-site values:
     # coverage (sum over alleles), dominant-allele coverage (max over alleles)
@@ -744,26 +767,11 @@ def aln2stats(args):
     # copy of x plus a python loop over tied sites, is not needed here.
     cov, dom, n_alleles = _site_summaries(x)
 
-    # site degeneracy from the marker sequences (for synonymous/fourfold and
-    # nonsynonymous/onefold polymorphism rates). `samestr filter
-    # --delete-pos` stores the kept original positions next to its output.
-    kept_file = os.path.join(os.path.dirname(args['input_file']),
-                             args['clade'] + '.pos.txt')
-    remaining_pos = np.loadtxt(kept_file, dtype=np.int64, ndmin=1) \
-        if exists(kept_file) else None
-    site_deg = syn_pairs = None
-    annotation = clade_site_annotation(args['marker_dir'], args['clade'],
-                                       x.shape[1], remaining_pos)
-    if annotation is not None:
-        site_deg, syn_pairs, n_cds, n_markers = annotation
-        LOG.debug('%s: %s of %s markers usable as in-frame CDS.' %
-                  (args['clade'], n_cds, n_markers))
-
     # stats: within-sample nucleotide diversity and Watterson's theta
-    # (per site, over sites with depth >= 2). Needs the full allele counts,
-    # so computed before x is released. With dominant variants only, every
-    # site is monomorphic and both are 0 (NaN without evaluable sites).
-    if args['dominant_variants']:
+    # (per site, over sites with depth >= 2). Needs the full allele counts.
+    # With dominant variants only, every site is monomorphic and both are 0
+    # (NaN without evaluable sites).
+    if dominant_variants:
         n_evaluable = (dom >= 2).sum(axis=1)
         average_nucleotide_diversity = np.where(n_evaluable > 0, 0., np.nan)
         theta_w = average_nucleotide_diversity.copy()
@@ -780,13 +788,12 @@ def aln2stats(args):
     if site_deg is not None:
         pi_ratios = nucleotide_diversity_ratio(
             x, site_deg, syn_pairs, cov=cov,
-            n_alleles=(dom > 0).astype(np.int8) if args['dominant_variants']
+            n_alleles=(dom > 0).astype(np.int8) if dominant_variants
             else n_alleles)
     else:
         pi_ratios = {k: np.full(x.shape[0], np.nan) for k in pi_keys}
-    del x
 
-    if args['dominant_variants']:
+    if dominant_variants:
         # analyze only dominant variants
         cov = dom.copy()
         n_alleles = (dom > 0).astype(np.int8)
@@ -886,9 +893,8 @@ def aln2stats(args):
                                      site_mask=site_deg == 1)
     del maf
 
-    # convert to pandas df
-    df = pd.DataFrame(data=[
-        np.array(samples), mean_cov, median_cov, n_sites, n_gaps, n_covered,
+    values = [
+        samples, mean_cov, median_cov, n_sites, n_gaps, n_covered,
         n_mono, n_duo, n_tri, n_quat, n_poly, f_covered, f_mono, f_duo, f_tri,
         f_quat, f_poly, mean_dom_cov, mean_f_dom_cov, median_f_dom_cov,
         mean_dom_cov_polysites, median_dom_cov_polysites,
@@ -903,24 +909,48 @@ def aln2stats(args):
         prate_1d['n_polymorphic'], prate_1d['n_sites_eval'],
         prate_1d['polymorphism_rate'],
         *[pi_ratios[k] for k in pi_keys]
-    ])
-    df = df.T
-    df.columns = [
-        'Sample', 'mean_cov', 'median_cov', 'n_sites', 'n_gaps', 'n_covered',
-        'n_mono', 'n_duo', 'n_tri', 'n_quat', 'n_poly', 'f_covered', 'f_mono',
-        'f_duo', 'f_tri', 'f_quat', 'f_poly', 'mean_dom_cov', 'mean_f_dom_cov',
-        'median_f_dom_cov', 'mean_dom_cov_polysites',
-        'median_dom_cov_polysites', 'mean_f_dom_cov_polysites',
-        'median_f_dom_cov_polysites', 'mean_cov_polysites', 'n_binom',
-        'f_binom', 'n_binom_segata', 'f_binom_segata',
-        'average_nucleotide_diversity', 'watterson_theta', 'mean_maf',
-        'median_maf', 'mean_maf_polysites', 'median_maf_polysites',
-        'n_poly_intermediate', 'n_sites_depth_ok', 'polymorphism_rate',
-        'n_poly_intermediate_syn', 'n_sites_depth_ok_syn',
-        'polymorphism_rate_syn',
-        'n_poly_intermediate_nonsyn', 'n_sites_depth_ok_nonsyn',
-        'polymorphism_rate_nonsyn', *pi_keys
     ]
+    # one column per statistic, keeping each statistic's numeric dtype
+    return pd.DataFrame(dict(zip(STAT_COLUMNS, values)),
+                        columns=list(STAT_COLUMNS))
+
+
+def aln2stats(args):
+
+    # if exists, skip
+    output_name = os.path.join(args['output_dir'], basename(args['input_file']))
+    if exists(output_name):
+        LOG.info('Skipping %s. Output file exists.' % args['clade'])
+        return True
+
+    # load sample order
+    with open(args['input_name'], 'r') as file:
+        samples = file.read().strip().split('\n')
+
+    LOG.info('Gathering stats for %s found in %s samples.' %
+             (args['clade'], len(samples)))
+
+    # load freqs
+    x = load_numpy_file(args['input_file'])
+
+    # site degeneracy from the marker sequences (for synonymous/fourfold and
+    # nonsynonymous/onefold polymorphism rates). `samestr filter
+    # --delete-pos` stores the kept original positions next to its output.
+    kept_file = os.path.join(os.path.dirname(args['input_file']),
+                             args['clade'] + '.pos.txt')
+    remaining_pos = np.loadtxt(kept_file, dtype=np.int64, ndmin=1) \
+        if exists(kept_file) else None
+    site_deg = syn_pairs = None
+    annotation = clade_site_annotation(args['marker_dir'], args['clade'],
+                                       x.shape[1], remaining_pos)
+    if annotation is not None:
+        site_deg, syn_pairs, n_cds, n_markers = annotation
+        LOG.debug('%s: %s of %s markers usable as in-frame CDS.' %
+                  (args['clade'], n_cds, n_markers))
+
+    df = sample_stats(x, samples, site_deg, syn_pairs,
+                      dominant_variants=args['dominant_variants'])
+    del x
 
     # write df to file
     ofn = '%s/%s.aln_stats.txt' % (args['output_dir'], args['clade'])
