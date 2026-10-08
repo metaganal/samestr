@@ -11,6 +11,7 @@ from Bio.Align import MultipleSeqAlignment
 
 from samestr.utils.utilities import load_numpy_file
 from samestr.filter import consensus
+from samestr.stats.alignment_stats import _site_pi_from_counts
 
 
 LOG = logging.getLogger(__name__)
@@ -71,6 +72,67 @@ def pairwise_counts(x, chunk=None):  # chunk unused (chunking disabled)
 
     # values are exact integers <= n_pos; int32 halves the output footprint
     return shared.astype(np.int32), overlap.astype(np.int32)
+
+
+def pairwise_pi(x, min_cov=4, min_allele_count=4):
+    """
+    All-vs-all nucleotide diversity over the positions of x (n_samples, n_pos,
+    4) that both samples of a pair cover with depth >= min_cov.
+
+    A non-dominant allele supported by fewer than min_allele_count reads is
+    discarded first (its reads leave the depth too), so sequencing errors do
+    not count as diversity; the dominant allele is always kept (on a tie, the
+    first in ACGT order). The defaults, 4 reads per site and 4 reads per
+    minor allele, follow Wasney et al. 2026 (Nat Commun,
+    doi:10.1038/s41467-026-70705-8), whose pi and Fst are the ones below, and
+    match samestr stats' Schloissnig pi ratios (min_allele_count=4).
+    min_allele_count=1 keeps every read.
+
+    n_sites[i, j]    = number of such positions
+    pi_within[i, j]  = sum over them of sample i's within-sample pi, the
+                       probability that two of its reads differ,
+                       (D^2 - sum_a n_a^2) / (D (D - 1)) (as samestr stats'
+                       average_nucleotide_diversity; asymmetric: row i over
+                       the positions it shares with column j)
+    pi_between[i, j] = sum over them of the probability that a read of i and
+                       a read of j differ, 1 - sum_a f_ia f_ja (no finite-depth
+                       correction: the two reads are never the same read)
+
+    Divided by n_sites these are per-site means over one site set, so
+    pairwise Fst (Hudson et al. 1992) follows as
+        1 - (pi_within[i, j] + pi_within[j, i]) / 2 / pi_between[i, j]
+    (see `samestr fst`).
+
+    Matrix products, as pairwise_counts: with M the (n, L) evaluable-site
+    indicator, F the allele frequencies (zero where not evaluable, flattened
+    to (n, 4L)) and P the per-site within pi (zero where not evaluable),
+        n_sites = M @ M.T,  pi_between = n_sites - F @ F.T,  pi_within = P @ M.T.
+    float64 throughout: Fst is 1 minus a ratio of two close sums, so the sums
+    need the precision. Peak memory ~ x + ~48 bytes * n * n_pos.
+    """
+    n = x.shape[0]
+    x = np.array(x, dtype=np.float64)                    # a copy: filtered below
+    if min_allele_count > 1:
+        minor = np.ones(x.shape, dtype=bool)
+        np.put_along_axis(minor, x.argmax(axis=2)[:, :, None], False, axis=2)
+        x[minor & (x < min_allele_count)] = 0.
+        del minor
+    depth = x.sum(axis=2)                                # (n, L)
+    ok = depth >= max(int(min_cov), 2)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        pw = np.where(ok, _site_pi_from_counts(x, depth), 0.)
+        f = np.where(ok[:, :, None], x / depth[:, :, None], 0.)
+    del x, depth
+
+    m = ok.astype(np.float64)
+    n_sites = m @ m.T
+    f = f.reshape(n, -1)
+    pi_between = n_sites - f @ f.T
+    del f
+    pi_within = pw @ m.T
+    # rounding can leave -1e-16 where two samples carry identical frequencies
+    np.maximum(pi_between, 0., out=pi_between)
+    return pi_within, pi_between, n_sites.astype(np.int64)
 
 
 def _write_matrix(path, samples, mat):
@@ -149,6 +211,18 @@ def compare(args):
     _write_matrix('%s/%s.closest.txt' % (args['output_dir'], args['clade']), samples, shared)
     _write_matrix('%s/%s.overlap.txt' % (args['output_dir'], args['clade']), samples, overlap)
     _write_matrix('%s/%s.fraction.txt' % (args['output_dir'], args['clade']), samples, fraction)
+
+    # nucleotide diversity within and between samples, per shared site, for
+    # pairwise Fst (`samestr fst`); NaN where a pair shares no such site
+    pi_within, pi_between, n_sites = pairwise_pi(
+        x, args.get('pi_min_cov', 4), args.get('pi_min_allele_count', 4))
+    with np.errstate(divide='ignore', invalid='ignore'):
+        pi_within /= n_sites
+        pi_between /= n_sites
+    _write_matrix('%s/%s.pi_within.txt' % (args['output_dir'], args['clade']), samples, pi_within)
+    _write_matrix('%s/%s.pi_between.txt' % (args['output_dir'], args['clade']), samples, pi_between)
+    _write_matrix('%s/%s.pi_sites.txt' % (args['output_dir'], args['clade']), samples, n_sites)
+    del pi_within, pi_between, n_sites
 
     # output dominant variants as msa
     if 'dominant_variants_msa' in args and args['dominant_variants_msa']:

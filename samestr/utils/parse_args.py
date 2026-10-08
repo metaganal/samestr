@@ -730,6 +730,27 @@ def read_params():
         required=False,
         action='store_true',
         help='Output alignment of dominant variants as fasta.')
+    compare_output.add_argument(
+        '--pi-min-cov',
+        required=False,
+        metavar='INT',
+        default=4,
+        type=int,
+        help='Minimum depth in both samples for a position to count toward the '
+        'pairwise nucleotide diversity outputs (.pi_within.txt, .pi_between.txt, '
+        '.pi_sites.txt), which `samestr fst` reads. Default as in Wasney et al. '
+        '2026 (Nat Commun); at least 2, for which within-sample pi is defined.')
+    compare_output.add_argument(
+        '--pi-min-allele-count',
+        required=False,
+        metavar='INT',
+        default=4,
+        type=int,
+        help='For the pairwise nucleotide diversity outputs, discard a '
+        'non-dominant allele supported by fewer reads than this, so sequencing '
+        'errors do not count as diversity. Default as in Wasney et al. 2026 and '
+        'Schloissnig et al. 2013 (and the pi ratios of `samestr stats`); 1 keeps '
+        'every read.')
 
     # SUMMARIZE
     summarize_parser = subparser.add_parser(
